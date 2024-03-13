@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-import string
 from dateutil import parser
 import itertools
 import json
@@ -15,6 +14,9 @@ import uuid
 import defusedxml.ElementTree as ET
 from urllib.robotparser import RobotFileParser
 from functools import lru_cache
+from logging import getLogger
+
+log = getLogger("INFO").info
 
 argparser = argparse.ArgumentParser()
 
@@ -65,6 +67,9 @@ argparser.add_argument('--ignore-robots-txt', required=False, default=None, help
 
 USER_AGENT = "FediFetcher (https://go.thms.uk/mgr)"
 
+session = requests.session()
+session.headers = {'User-Agent': USER_AGENT}
+
 
 @lru_cache(10000)
 def get_robots_txt(url):
@@ -111,27 +116,31 @@ def get_favourites(server, access_token, max):
     })
 
 
-def add_user_posts(server, access_token, followings, known_followings, all_known_users, seen_urls, seen_hosts):
-    for user in followings:
-        if user['acct'] not in all_known_users and not user['url'].startswith(f"https://{server}/"):
-            posts = get_user_posts(user, known_followings, server, seen_hosts)
+@dataclass
+class HomeMastodon:
+    server: str
+    access_token: str
 
-            if (posts != None):
-                count = 0
-                failed = 0
-                for post in posts:
-                    if post.get('reblog') is None and post.get('renoteId') is None and post.get(
-                            'url') is not None and post.get('url') not in seen_urls:
-                        added = add_post_with_context(post, server, access_token, seen_urls, seen_hosts)
-                        if added is True:
-                            seen_urls.add(post['url'])
-                            count += 1
-                        else:
-                            failed += 1
-                log(f"Added {count} posts for user {user['acct']} with {failed} errors")
-                if failed == 0:
-                    known_followings.add(user['acct'])
-                    all_known_users.add(user['acct'])
+    def add_user_posts(self, followings, known_followings, all_known_users, seen_urls, seen_hosts):
+        for user in followings:
+            if user['acct'] not in all_known_users and not user['url'].startswith(f"https://{server}/"):
+                posts = get_user_posts(user, known_followings, server, seen_hosts)
+                if (posts != None):
+                    count = 0
+                    failed = 0
+                    for post in posts:
+                        if post.get('reblog') is None and post.get('renoteId') is None and post.get(
+                                'url') is not None and post.get('url') not in seen_urls:
+                            added = add_post_with_context(post, server, access_token, seen_urls, seen_hosts)
+                            if added is True:
+                                seen_urls.add(post['url'])
+                                count += 1
+                            else:
+                                failed += 1
+                    log(f"Added {count} posts for user {user['acct']} with {failed} errors")
+                    if failed == 0:
+                        known_followings.add(user['acct'])
+                        all_known_users.add(user['acct'])
 
 
 def add_post_with_context(post, server, access_token, seen_urls, seen_hosts):
@@ -586,64 +595,27 @@ def get_replied_toot_server_id(server, toot, replied_toot_server_ids, parsed_url
 
 
 def parse_user_url(url):
-    match = parse_mastodon_profile_url(url)
-    if match is not None:
-        return match
-
-    match = parse_pleroma_profile_url(url)
-    if match is not None:
-        return match
-
-    match = parse_lemmy_profile_url(url)
-    if match is not None:
-        return match
-
-    # Pixelfed profile paths do not use a subdirectory, so we need to match for them last.
-    match = parse_pixelfed_profile_url(url)
-    if match is not None:
-        return match
-
+    matchers = [parse_mastodon_url, parse_pleroma_url, parse_lemmy_url]
+    for matcher in matchers:
+        match = matcher(url)
+        if match is not None:
+            return match
     log(f"Error parsing Profile URL {url}")
-
-    return None
 
 
 def parse_url(url, parsed_urls):
-    if url not in parsed_urls:
-        match = parse_mastodon_url(url)
-        if match is not None:
-            parsed_urls[url] = match
-
-    if url not in parsed_urls:
-        match = parse_mastodon_uri(url)
-        if match is not None:
-            parsed_urls[url] = match
-
-    if url not in parsed_urls:
-        match = parse_pleroma_url(url)
-        if match is not None:
-            parsed_urls[url] = match
-
-    if url not in parsed_urls:
-        match = parse_lemmy_url(url)
-        if match is not None:
-            parsed_urls[url] = match
-
-    if url not in parsed_urls:
-        match = parse_pixelfed_url(url)
-        if match is not None:
-            parsed_urls[url] = match
-
-    if url not in parsed_urls:
-        match = parse_misskey_url(url)
-        if match is not None:
-            parsed_urls[url] = match
+    matchers = [parse_mastodon_url, parse_mastodon_uri, parse_pleroma_url, parse_lemmy_url, parse_pixelfed_url,
+                parse_misskey_url]
+    for matcher in matchers:
+        if url not in parsed_urls:
+            match = matcher(url)
+            if match is not None:
+                parsed_urls[url] = match
+                return parsed_urls[url]
 
     if url not in parsed_urls:
         log(f"Error parsing toot URL {url}")
         parsed_urls[url] = None
-
-    return parsed_urls[url]
 
 
 def parse_mastodon_profile_url(url):
@@ -750,7 +722,7 @@ def get_redirect_url(url):
     """get the URL given URL redirects to"""
     try:
         resp = requests.head(url, allow_redirects=False, timeout=5, headers={
-            'User-Agent': 'FediFetcher (https://go.thms.uk/mgr)'
+            'User-Agent': USER_AGENT
         })
     except Exception as ex:
         log(f"Error getting redirect URL for URL {url}. Exception: {ex}")
@@ -1089,40 +1061,6 @@ def post(url, json, headers={}, timeout=0, max_tries=5):
     return response
 
 
-def log(text):
-    print(f"{datetime.now()} {datetime.now().astimezone().tzinfo}: {text}")
-
-
-class ServerList:
-    def __init__(self, iterable):
-        self._dict = {}
-        for item in iterable:
-            if ('last_checked' in iterable[item]):
-                iterable[item]['last_checked'] = parser.parse(iterable[item]['last_checked'])
-            self.add(item, iterable[item])
-
-    def add(self, key, item):
-        self._dict[key] = item
-
-    def get(self, key):
-        return self._dict[key]
-
-    def pop(self, key):
-        return self._dict.pop(key)
-
-    def __contains__(self, item):
-        return item in self._dict
-
-    def __iter__(self):
-        return iter(self._dict)
-
-    def __len__(self):
-        return len(self._dict)
-
-    def toJSON(self):
-        return json.dumps(self._dict, default=str)
-
-
 class OrderedSet:
     """An ordered set implementation over a dict"""
 
@@ -1404,22 +1342,22 @@ if __name__ == "__main__":
         RECENTLY_CHECKED_USERS_FILE = os.path.join(arguments.state_dir, "recently_checked_users")
         SEEN_HOSTS_FILE = os.path.join(arguments.state_dir, "seen_hosts")
 
-        seen_urls = OrderedSet([])
+        seen_urls = set()
         if os.path.exists(SEEN_URLS_FILE):
             with open(SEEN_URLS_FILE, "r", encoding="utf-8") as f:
-                seen_urls = OrderedSet(f.read().splitlines())
+                seen_urls = set(f.read().splitlines())
 
         replied_toot_server_ids = {}
         if os.path.exists(REPLIED_TOOT_SERVER_IDS_FILE):
             with open(REPLIED_TOOT_SERVER_IDS_FILE, "r", encoding="utf-8") as f:
                 replied_toot_server_ids = json.load(f)
 
-        known_followings = OrderedSet([])
+        known_followings = set()
         if os.path.exists(KNOWN_FOLLOWINGS_FILE):
             with open(KNOWN_FOLLOWINGS_FILE, "r", encoding="utf-8") as f:
-                known_followings = OrderedSet(f.read().splitlines())
+                known_followings = set(f.read().splitlines())
 
-        recently_checked_users = OrderedSet({})
+        recently_checked_users = set({})
         if os.path.exists(RECENTLY_CHECKED_USERS_FILE):
             with open(RECENTLY_CHECKED_USERS_FILE, "r", encoding="utf-8") as f:
                 recently_checked_users = OrderedSet(json.load(f))
@@ -1454,8 +1392,9 @@ if __name__ == "__main__":
         if (isinstance(arguments.access_token, str)):
             setattr(arguments, 'access_token', [arguments.access_token])
 
+        home = HomeMastodon(arguments.server, "")
         for token in arguments.access_token:
-
+            home.access_token = token
             if arguments.reply_interval_in_hours > 0:
                 """pull the context toots of toots user replied to, from their
                 original server, and add them to the local server."""
@@ -1497,36 +1436,32 @@ if __name__ == "__main__":
                             if user not in mentioned_users and user['acct'] not in all_known_users:
                                 mentioned_users.append(user)
 
-                    add_user_posts(arguments.server, token, filter_known_users(mentioned_users, all_known_users),
-                                   recently_checked_users, all_known_users, seen_urls, seen_hosts)
+                    home.add_user_posts(filter_known_users(mentioned_users, all_known_users),
+                                        recently_checked_users, all_known_users, seen_urls, seen_hosts)
 
             if arguments.max_followings > 0:
                 log(f"Getting posts from last {arguments.max_followings} followings")
                 user_id = get_user_id(arguments.server, arguments.user, token)
                 followings = get_new_followings(arguments.server, user_id, arguments.max_followings, all_known_users)
-                add_user_posts(arguments.server, token, followings, known_followings, all_known_users, seen_urls,
-                               seen_hosts)
+                home.add_user_posts(followings, known_followings, all_known_users, seen_urls, seen_hosts)
 
             if arguments.max_followers > 0:
                 log(f"Getting posts from last {arguments.max_followers} followers")
                 user_id = get_user_id(arguments.server, arguments.user, token)
                 followers = get_new_followers(arguments.server, user_id, arguments.max_followers, all_known_users)
-                add_user_posts(arguments.server, token, followers, recently_checked_users, all_known_users, seen_urls,
-                               seen_hosts)
+                home.add_user_posts(followers, recently_checked_users, all_known_users, seen_urls, seen_hosts)
 
             if arguments.max_follow_requests > 0:
                 log(f"Getting posts from last {arguments.max_follow_requests} follow requests")
                 follow_requests = get_new_follow_requests(arguments.server, token, arguments.max_follow_requests,
                                                           all_known_users)
-                add_user_posts(arguments.server, token, follow_requests, recently_checked_users, all_known_users,
-                               seen_urls, seen_hosts)
+                home.add_user_posts(follow_requests, recently_checked_users, all_known_users, seen_urls, seen_hosts)
 
             if arguments.from_notifications > 0:
                 log(f"Getting notifications for last {arguments.from_notifications} hours")
                 notification_users = get_notification_users(arguments.server, token, all_known_users,
                                                             arguments.from_notifications)
-                add_user_posts(arguments.server, token, notification_users, recently_checked_users, all_known_users,
-                               seen_urls, seen_hosts)
+                home.add_user_posts(notification_users, recently_checked_users, all_known_users, seen_urls, seen_hosts)
 
             if arguments.max_bookmarks > 0:
                 log(f"Pulling replies to the last {arguments.max_bookmarks} bookmarks")
@@ -1557,7 +1492,7 @@ if __name__ == "__main__":
 
         os.remove(LOCK_FILE)
 
-        if (arguments.on_done != None and arguments.on_done != ''):
+        if arguments.on_done != None and arguments.on_done != '':
             try:
                 get(f"{arguments.on_done}?rid={runId}")
             except Exception as ex:
