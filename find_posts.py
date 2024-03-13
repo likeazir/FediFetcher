@@ -42,7 +42,7 @@ argparser.add_argument('--max-bookmarks', required=False, type=int, default=0,
 argparser.add_argument('--max-favourites', required=False, type=int, default=0,
                        help="Fetch remote replies to the API key owners Favourites. We'll fetch replies to at most this many favourites")
 argparser.add_argument('--from-notifications', required=False, type=int, default=0,
-                       help="Backfill accounts of anyone appearing in your notifications, during the last hours")
+                       help="Backfill accounts of anyone appear   ing in your notifications, during the last hours")
 argparser.add_argument('--remember-users-for-hours', required=False, type=int, default=24 * 7,
                        help="How long to remember users that you aren't following for, before trying to backfill them again.")
 argparser.add_argument('--remember-hosts-for-days', required=False, type=int, default=30,
@@ -70,7 +70,6 @@ USER_AGENT = "FediFetcher (https://go.thms.uk/mgr)"
 session = requests.session()
 session.headers = {'User-Agent': USER_AGENT}
 
-
 @lru_cache(10000)
 def get_robots_txt(url):
     rp = RobotFileParser()
@@ -85,79 +84,124 @@ def check_url(url):
     rp = get_robots_txt(robots_url)
     return rp.can_fetch(USER_AGENT, url)
 
-
-def get_notification_users(server, access_token, known_users, max_age):
-    since = datetime.now(datetime.now().astimezone().tzinfo) - timedelta(hours=max_age)
-    notifications = get_paginated_mastodon(f"https://{server}/api/v1/notifications", since, headers={
-        "Authorization": f"Bearer {access_token}",
-    })
-    notification_users = []
-    for notification in notifications:
-        notificationDate = parser.parse(notification['created_at'])
-        if (notificationDate >= since and notification['account'] not in notification_users):
-            notification_users.append(notification['account'])
-
-    new_notification_users = filter_known_users(notification_users, known_users)
-
-    log(f"Found {len(notification_users)} users in notifications, {len(new_notification_users)} of which are new")
-
-    return new_notification_users
-
-
-def get_bookmarks(server, access_token, max):
-    return get_paginated_mastodon(f"https://{server}/api/v1/bookmarks", max, {
-        "Authorization": f"Bearer {access_token}",
-    })
-
-
-def get_favourites(server, access_token, max):
-    return get_paginated_mastodon(f"https://{server}/api/v1/favourites", max, {
-        "Authorization": f"Bearer {access_token}",
-    })
-
-
 @dataclass
-class HomeMastodon:
+class LocalMastodon:
     server: str
     access_token: str
+    seen_urls: set[str]
+    known_followings: set[str]
+    all_known_users: set[str]
+    seen_hosts: dict[str, any]
 
-    def add_user_posts(self, followings, known_followings, all_known_users, seen_urls, seen_hosts):
-        for user in followings:
-            if user['acct'] not in all_known_users and not user['url'].startswith(f"https://{server}/"):
-                posts = get_user_posts(user, known_followings, server, seen_hosts)
-                if (posts != None):
-                    count = 0
-                    failed = 0
-                    for post in posts:
-                        if post.get('reblog') is None and post.get('renoteId') is None and post.get(
-                                'url') is not None and post.get('url') not in seen_urls:
-                            added = add_post_with_context(post, server, access_token, seen_urls, seen_hosts)
-                            if added is True:
-                                seen_urls.add(post['url'])
-                                count += 1
-                            else:
-                                failed += 1
-                    log(f"Added {count} posts for user {user['acct']} with {failed} errors")
-                    if failed == 0:
-                        known_followings.add(user['acct'])
-                        all_known_users.add(user['acct'])
+    def add_user_posts(self, users: list[any]) -> None:
+        for user in users:
+            if user['acct'] in self.all_known_users or user['url'].startswith(f"https://{self.server}/"):
+                continue
+            posts = get_user_posts(user, self.known_followings, self.server, self.seen_hosts)
+            if posts is None:
+                continue
+            count = 0
+            failed = 0
+            for post in posts:
+                if post.get('reblog') is not None or post.get('renoteId') is not None or post.get(
+                        'url') is None or post.get('url') in self.seen_urls:
+                    continue
+                added = self.add_post_with_context(post)
+                if added:
+                    self.seen_urls.add(post['url'])
+                    count += 1
+                else:
+                    failed += 1
+            log(f"Added {count} posts for user {user['acct']} with {failed} errors")
+            if failed == 0:
+                self.known_followings.add(user['acct'])
+                self.all_known_users.add(user['acct'])
 
-
-def add_post_with_context(post, server, access_token, seen_urls, seen_hosts):
-    added = add_context_url(post['url'], server, access_token)
-    if added is True:
-        seen_urls.add(post['url'])
+    def add_post_with_context(self, post):
+        added = self.add_context_url(post['url'])
+        if not added:
+            return False
+        self.seen_urls.add(post['url'])
         if ('replies_count' in post or 'in_reply_to_id' in post) and getattr(arguments, 'backfill_with_context', 0) > 0:
             parsed_urls = {}
             parsed = parse_url(post['url'], parsed_urls)
-            if parsed == None:
+            if parsed is None:
                 return True
-            known_context_urls = get_all_known_context_urls(server, [post], parsed_urls, seen_hosts)
-            add_context_urls(server, access_token, known_context_urls, seen_urls)
+            known_context_urls = get_all_known_context_urls([post])
+            self.add_context_urls(known_context_urls)
         return True
 
-    return False
+    def add_context_urls(self, context_urls):
+        """add the given toot URLs to the server"""
+        count = 0
+        failed = 0
+        for url in context_urls:
+            if url in self.seen_urls:
+                continue
+            added = self.add_context_url(url)
+            if added:
+                self.seen_urls.add(url)
+                count += 1
+            else:
+                failed += 1
+        log(f"Added {count} new context toots (with {failed} failures)")
 
+    def add_context_url(self, url):
+        """add the given toot URL to the server"""
+        search_url = f"https://{self.server}/api/v2/search?q={url}&resolve=true&limit=1"
+        try:
+            resp = get(search_url, headers={
+                "Authorization": f"Bearer {self.access_token}",
+            })
+        except Exception as ex:
+            log(
+                f"Error adding url {search_url} to server {self.server}. Exception: {ex}"
+            )
+            return False
+
+        if resp.status_code == 200:
+            log(f"Added context url {url}")
+            return True
+        elif resp.status_code == 403:
+            log(
+                f"Error adding url {search_url} to server {self.server}. Status code: {resp.status_code}. "
+                "Make sure you have the read:search scope enabled for your access token."
+            )
+            return False
+        else:
+            log(
+                f"Error adding url {search_url} to server {self.server}. Status code: {resp.status_code}"
+            )
+            return False
+
+    def get_notification_users(self, max_age):
+        since = datetime.now(datetime.now().astimezone().tzinfo) - timedelta(hours=max_age)
+        notifications = get_paginated_mastodon(f"https://{self.server}/api/v1/notifications", since, headers={
+            "Authorization": f"Bearer {self.access_token}",
+        })
+        notification_users = []
+        for notification in notifications:
+            notificationDate = parser.parse(notification['created_at'])
+            if (notificationDate >= since and notification['account'] not in notification_users):
+                notification_users.append(notification['account'])
+
+        new_notification_users = filter_known_users(notification_users, all_known_users)
+
+        log(f"Found {len(notification_users)} users in notifications, {len(new_notification_users)} of which are new")
+
+        return new_notification_users
+
+
+    def get_bookmarks(self, max):
+        return get_paginated_mastodon(f"https://{self.server}/api/v1/bookmarks", max, {
+            "Authorization": f"Bearer {self.access_token}",
+        })
+
+
+    def get_favourites(self, max):
+        return get_paginated_mastodon(f"https://{self.server}/api/v1/favourites", max, {
+            "Authorization": f"Bearer {self.access_token}",
+        })
 
 def get_user_posts(user, known_followings, server, seen_hosts):
     parsed_url = parse_user_url(user['url'])
@@ -905,53 +949,6 @@ def get_misskey_urls(webserver, post_id, toot_url):
 
     return urls
 
-
-def add_context_urls(server, access_token, context_urls, seen_urls):
-    """add the given toot URLs to the server"""
-    count = 0
-    failed = 0
-    for url in context_urls:
-        if url not in seen_urls:
-            added = add_context_url(url, server, access_token)
-            if added is True:
-                seen_urls.add(url)
-                count += 1
-            else:
-                failed += 1
-
-    log(f"Added {count} new context toots (with {failed} failures)")
-
-
-def add_context_url(url, server, access_token):
-    """add the given toot URL to the server"""
-    search_url = f"https://{server}/api/v2/search?q={url}&resolve=true&limit=1"
-
-    try:
-        resp = get(search_url, headers={
-            "Authorization": f"Bearer {access_token}",
-        })
-    except Exception as ex:
-        log(
-            f"Error adding url {search_url} to server {server}. Exception: {ex}"
-        )
-        return False
-
-    if resp.status_code == 200:
-        log(f"Added context url {url}")
-        return True
-    elif resp.status_code == 403:
-        log(
-            f"Error adding url {search_url} to server {server}. Status code: {resp.status_code}. "
-            "Make sure you have the read:search scope enabled for your access token."
-        )
-        return False
-    else:
-        log(
-            f"Error adding url {search_url} to server {server}. Status code: {resp.status_code}"
-        )
-        return False
-
-
 def get_paginated_mastodon(url, max, headers={}, timeout=0, max_tries=5):
     """Make a paginated request to mastodon"""
     if (isinstance(max, int)):
@@ -1061,37 +1058,22 @@ def post(url, json, headers={}, timeout=0, max_tries=5):
     return response
 
 
-class OrderedSet:
-    """An ordered set implementation over a dict"""
-
+class ServerList:
     def __init__(self, iterable):
         self._dict = {}
-        if isinstance(iterable, dict):
-            for item in iterable:
-                if isinstance(iterable[item], str):
-                    self.add(item, parser.parse(iterable[item]))
-                else:
-                    self.add(item, iterable[item])
-        else:
-            for item in iterable:
-                self.add(item)
-
-    def add(self, item, time=None):
-        if item not in self._dict:
-            if (time == None):
-                self._dict[item] = datetime.now(datetime.now().astimezone().tzinfo)
-            else:
-                self._dict[item] = time
-
-    def pop(self, item):
-        self._dict.pop(item)
-
-    def get(self, item):
-        return self._dict[item]
-
-    def update(self, iterable):
         for item in iterable:
-            self.add(item)
+            if('last_checked' in iterable[item]):
+                iterable[item]['last_checked'] = parser.parse(iterable[item]['last_checked'])
+            self.add(item, iterable[item])
+
+    def add(self, key, item):
+        self._dict[key] = item
+
+    def get(self, key):
+        return self._dict[key]
+
+    def pop(self, key):
+        return self._dict.pop(key)
 
     def __contains__(self, item):
         return item in self._dict
@@ -1223,7 +1205,7 @@ def get_nodeinfo(server, seen_hosts, host_meta_fallback=False):
 def get_server_info(server, seen_hosts):
     if server in seen_hosts:
         serverInfo = seen_hosts.get(server)
-        if ('info' in serverInfo and serverInfo['info'] == None):
+        if 'info' in serverInfo and serverInfo['info'] is None:
             return None
         return serverInfo
 
@@ -1360,7 +1342,7 @@ if __name__ == "__main__":
         recently_checked_users = set({})
         if os.path.exists(RECENTLY_CHECKED_USERS_FILE):
             with open(RECENTLY_CHECKED_USERS_FILE, "r", encoding="utf-8") as f:
-                recently_checked_users = OrderedSet(json.load(f))
+                recently_checked_users = set(json.load(f))
 
         # Remove any users whose last check is too long in the past from the list
         for user in list(recently_checked_users):
@@ -1371,7 +1353,7 @@ if __name__ == "__main__":
 
         parsed_urls = {}
 
-        all_known_users = OrderedSet(list(known_followings) + list(recently_checked_users))
+        all_known_users = set(list(known_followings) + list(recently_checked_users))
 
         if os.path.exists(SEEN_HOSTS_FILE):
             with open(SEEN_HOSTS_FILE, "r", encoding="utf-8") as f:
@@ -1392,7 +1374,7 @@ if __name__ == "__main__":
         if (isinstance(arguments.access_token, str)):
             setattr(arguments, 'access_token', [arguments.access_token])
 
-        home = HomeMastodon(arguments.server, "")
+        home = LocalMastodon(arguments.server, arguments.access_token, seen_urls, known_followings, all_known_users)
         for token in arguments.access_token:
             home.access_token = token
             if arguments.reply_interval_in_hours > 0:
@@ -1408,14 +1390,14 @@ if __name__ == "__main__":
                     arguments.server, reply_toots, replied_toot_server_ids, parsed_urls
                 )
                 context_urls = get_all_context_urls(arguments.server, replied_toot_ids, seen_hosts)
-                add_context_urls(arguments.server, token, context_urls, seen_urls)
+                home.add_context_urls(context_urls)
 
             if arguments.home_timeline_length > 0:
                 """Do the same with any toots on the key owner's home timeline """
                 timeline_toots = get_timeline(arguments.server, token, arguments.home_timeline_length)
                 known_context_urls = get_all_known_context_urls(arguments.server, timeline_toots, parsed_urls,
                                                                 seen_hosts)
-                add_context_urls(arguments.server, token, known_context_urls, seen_urls)
+                home.add_context_urls(known_context_urls)
 
                 # Backfill any post authors, and any mentioned users
                 if arguments.backfill_mentioned_users > 0:
@@ -1436,44 +1418,43 @@ if __name__ == "__main__":
                             if user not in mentioned_users and user['acct'] not in all_known_users:
                                 mentioned_users.append(user)
 
-                    home.add_user_posts(filter_known_users(mentioned_users, all_known_users),
-                                        recently_checked_users, all_known_users, seen_urls, seen_hosts)
+                    home.add_user_posts(filter_known_users(mentioned_users, all_known_users))
 
             if arguments.max_followings > 0:
                 log(f"Getting posts from last {arguments.max_followings} followings")
                 user_id = get_user_id(arguments.server, arguments.user, token)
                 followings = get_new_followings(arguments.server, user_id, arguments.max_followings, all_known_users)
-                home.add_user_posts(followings, known_followings, all_known_users, seen_urls, seen_hosts)
+                home.add_user_posts(followings)
 
             if arguments.max_followers > 0:
                 log(f"Getting posts from last {arguments.max_followers} followers")
                 user_id = get_user_id(arguments.server, arguments.user, token)
                 followers = get_new_followers(arguments.server, user_id, arguments.max_followers, all_known_users)
-                home.add_user_posts(followers, recently_checked_users, all_known_users, seen_urls, seen_hosts)
+                home.add_user_posts(followers)
 
             if arguments.max_follow_requests > 0:
                 log(f"Getting posts from last {arguments.max_follow_requests} follow requests")
                 follow_requests = get_new_follow_requests(arguments.server, token, arguments.max_follow_requests,
                                                           all_known_users)
-                home.add_user_posts(follow_requests, recently_checked_users, all_known_users, seen_urls, seen_hosts)
+                home.add_user_posts(follow_requests)
 
             if arguments.from_notifications > 0:
                 log(f"Getting notifications for last {arguments.from_notifications} hours")
                 notification_users = get_notification_users(arguments.server, token, all_known_users,
                                                             arguments.from_notifications)
-                home.add_user_posts(notification_users, recently_checked_users, all_known_users, seen_urls, seen_hosts)
+                home.add_user_posts(notification_users)
 
             if arguments.max_bookmarks > 0:
                 log(f"Pulling replies to the last {arguments.max_bookmarks} bookmarks")
                 bookmarks = get_bookmarks(arguments.server, token, arguments.max_bookmarks)
                 known_context_urls = get_all_known_context_urls(arguments.server, bookmarks, parsed_urls, seen_hosts)
-                add_context_urls(arguments.server, token, known_context_urls, seen_urls)
+                home.add_context_urls(known_context_urls)
 
             if arguments.max_favourites > 0:
                 log(f"Pulling replies to the last {arguments.max_favourites} favourites")
                 favourites = get_favourites(arguments.server, token, arguments.max_favourites)
                 known_context_urls = get_all_known_context_urls(arguments.server, favourites, parsed_urls, seen_hosts)
-                add_context_urls(arguments.server, token, known_context_urls, seen_urls)
+                home.add_context_urls(known_context_urls)
 
         with open(KNOWN_FOLLOWINGS_FILE, "w", encoding="utf-8") as f:
             f.write("\n".join(list(known_followings)[-10000:]))
@@ -1492,7 +1473,7 @@ if __name__ == "__main__":
 
         os.remove(LOCK_FILE)
 
-        if arguments.on_done != None and arguments.on_done != '':
+        if arguments.on_done is not None and arguments.on_done != '':
             try:
                 get(f"{arguments.on_done}?rid={runId}")
             except Exception as ex:
@@ -1503,7 +1484,7 @@ if __name__ == "__main__":
     except Exception as ex:
         os.remove(LOCK_FILE)
         log(f"Job failed after {datetime.now() - start}.")
-        if (arguments.on_fail != None and arguments.on_fail != ''):
+        if arguments.on_fail is not None and arguments.on_fail != '':
             try:
                 get(f"{arguments.on_fail}?rid={runId}")
             except Exception as ex:
